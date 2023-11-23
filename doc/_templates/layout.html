@@ -1,0 +1,42 @@
+{% extends "!layout.html" %}
+{%- block content %}
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      {# Using an ID here so that the skip-link works #}
+      <main id="main-content" class="bd-main">
+        {# Main content area #}
+        {% block docs_main %}
+          <div class="bd-content">
+            <div class="bd-article-container">
+              {# Article content #}
+              {% block docs_body %}
+              {# This is empty and only shows up if text has been highlighted by the URL #}
+                {% include "components/searchbox.html" %}
+                <article class="bd-article" role="main">
+                  {% block body %}{% endblock %}
+                </article>
+              {% endblock docs_body %}
+              {# Article Footer #}
+              {% if theme_article_footer_items %}
+                <footer class="bd-footer-article">
+                  {% include "sections/footer-article.html" %}
+                </footer>
+              {% endif %}
+              {# prev-next buttons #}
+              {% if theme_show_prev_next %}
+                <footer class="prev-next-footer">
+                  {% include "components/prev-next.html" %}
+                </footer>
+              {% endif %}
+            </div>
+          </div>
+          <footer class="bd-footer-content">
+            {% include "sections/footer-content.html" %}
+          </footer>
+        {% endblock docs_main %}
+      </main>
+    </div>
+  </div>
+  {# Scripts placed at the end of the page to cut down on time to first content #}
+  {%- block scripts_end %}{{ _webpack.body_post() }}{%- endblock scripts_end %}
+{%- endblock content %}

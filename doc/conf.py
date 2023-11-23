@@ -203,7 +203,10 @@ today_fmt = "%Y-%m-%d"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
-exclude_patterns = ["_build", "**.ipynb_checkpoints"]
+exclude_patterns = ["_build", "**.ipynb_checkpoints",
+                    "developers-meeting.rst",
+                    "whats-new.rst",
+                    ]
 
 
 # The name of the Pygments (syntax highlighting) style to use.
@@ -233,10 +236,10 @@ html_theme_options = dict(
     repository_branch="main",
     navigation_with_keys=False,  # pydata/pydata-sphinx-theme#1492
     path_to_docs="doc",
-    use_edit_page_button=True,
-    use_repository_button=True,
-    use_issues_button=True,
-    home_page_in_toc=False,
+    # use_edit_page_button=True,
+    # use_repository_button=True,
+    # use_issues_button=True,
+    # home_page_in_toc=False,
     extra_footer="""<p>Xarray is a fiscally sponsored project of <a href="https://numfocus.org">NumFOCUS</a>,
     a nonprofit dedicated to supporting the open-source scientific computing community.<br>
     Theme by the <a href="https://ebp.jupyterbook.org">Executable Book Project</a></p>""",
