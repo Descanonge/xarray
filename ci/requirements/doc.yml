@@ -40,5 +40,6 @@ dependencies:
   - pip:
       - sphinxext-rediraffe
       - sphinxext-opengraph
+      - doc2dash
       # relative to this file. Needs to be editable to be accepted.
       - -e ../..
