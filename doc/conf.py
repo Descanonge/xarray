@@ -87,7 +87,6 @@ extensions = [
     "sphinx_inline_tabs",
 ]
 
-
 extlinks = {
     "issue": ("https://github.com/pydata/xarray/issues/%s", "GH%s"),
     "pull": ("https://github.com/pydata/xarray/pull/%s", "PR%s"),
@@ -205,8 +204,7 @@ today_fmt = "%Y-%m-%d"
 # directories to ignore when looking for source files.
 exclude_patterns = ["_build", "**.ipynb_checkpoints",
                     "developers-meeting.rst",
-                    "whats-new.rst",
-                    ]
+                    "whats-new.rst"]
 
 
 # The name of the Pygments (syntax highlighting) style to use.
