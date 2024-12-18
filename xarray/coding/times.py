@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 import warnings
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from datetime import datetime, timedelta
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Union
+from typing import TYPE_CHECKING, Literal, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -22,21 +22,23 @@ from xarray.coding.variables import (
 )
 from xarray.core import indexing
 from xarray.core.common import contains_cftime_datetimes, is_np_datetime_like
+from xarray.core.duck_array_ops import asarray, ravel, reshape
 from xarray.core.formatting import first_n_items, format_timestamp, last_item
 from xarray.core.pdcompat import nanosecond_precision_timestamp
-from xarray.core.pycompat import is_duck_dask_array
-from xarray.core.utils import emit_user_level_warning
+from xarray.core.utils import attempt_import, emit_user_level_warning
 from xarray.core.variable import Variable
+from xarray.namedarray.parallelcompat import T_ChunkedArray, get_chunked_array_type
+from xarray.namedarray.pycompat import is_chunked_array
+from xarray.namedarray.utils import is_duck_dask_array
 
 try:
     import cftime
 except ImportError:
     cftime = None
 
-if TYPE_CHECKING:
-    from xarray.core.types import CFCalendar
+from xarray.core.types import CFCalendar, NPDatetimeUnitOptions, T_DuckArray
 
-    T_Name = Union[Hashable, None]
+T_Name = Union[Hashable, None]
 
 # standard calendars recognized by cftime
 _STANDARD_CALENDARS = {"standard", "gregorian", "proleptic_gregorian"}
@@ -108,22 +110,25 @@ def _is_numpy_compatible_time_range(times):
         return True
 
 
-def _netcdf_to_numpy_timeunit(units: str) -> str:
+def _netcdf_to_numpy_timeunit(units: str) -> NPDatetimeUnitOptions:
     units = units.lower()
     if not units.endswith("s"):
         units = f"{units}s"
-    return {
-        "nanoseconds": "ns",
-        "microseconds": "us",
-        "milliseconds": "ms",
-        "seconds": "s",
-        "minutes": "m",
-        "hours": "h",
-        "days": "D",
-    }[units]
+    return cast(
+        NPDatetimeUnitOptions,
+        {
+            "nanoseconds": "ns",
+            "microseconds": "us",
+            "milliseconds": "ms",
+            "seconds": "s",
+            "minutes": "m",
+            "hours": "h",
+            "days": "D",
+        }[units],
+    )
 
 
-def _numpy_to_netcdf_timeunit(units: str) -> str:
+def _numpy_to_netcdf_timeunit(units: NPDatetimeUnitOptions) -> str:
     return {
         "ns": "nanoseconds",
         "us": "microseconds",
@@ -164,7 +169,7 @@ def _ensure_padded_year(ref_date: str) -> str:
         "To remove this message, remove the ambiguity by padding your reference "
         "date strings with zeros."
     )
-    warnings.warn(warning_msg, SerializationWarning)
+    warnings.warn(warning_msg, SerializationWarning, stacklevel=2)
 
     return ref_date_padded
 
@@ -199,7 +204,7 @@ def _unpack_time_units_and_ref_date(units: str) -> tuple[str, pd.Timestamp]:
 
 
 def _decode_cf_datetime_dtype(
-    data, units: str, calendar: str, use_cftime: bool | None
+    data, units: str, calendar: str | None, use_cftime: bool | None
 ) -> np.dtype:
     # Verify that at least the first and last date can be decoded
     # successfully. Otherwise, tracebacks end up swallowed by
@@ -211,7 +216,7 @@ def _decode_cf_datetime_dtype(
 
     try:
         result = decode_cf_datetime(example_value, units, calendar, use_cftime)
-    except Exception:
+    except Exception as err:
         calendar_msg = (
             "the default calendar" if calendar is None else f"calendar {calendar!r}"
         )
@@ -220,7 +225,7 @@ def _decode_cf_datetime_dtype(
             "opening your dataset with decode_times=False or installing cftime "
             "if it is not installed."
         )
-        raise ValueError(msg)
+        raise ValueError(msg) from err
     else:
         dtype = getattr(result, "dtype", np.dtype("object"))
 
@@ -230,8 +235,10 @@ def _decode_cf_datetime_dtype(
 def _decode_datetime_with_cftime(
     num_dates: np.ndarray, units: str, calendar: str
 ) -> np.ndarray:
-    if cftime is None:
-        raise ModuleNotFoundError("No module named 'cftime'")
+    if TYPE_CHECKING:
+        import cftime
+    else:
+        cftime = attempt_import("cftime")
     if num_dates.size > 0:
         return np.asarray(
             cftime.num2date(num_dates, units, calendar, only_use_cftime_datetimes=True)
@@ -249,16 +256,25 @@ def _decode_datetime_with_pandas(
             "pandas."
         )
 
-    time_units, ref_date = _unpack_netcdf_time_units(units)
+    # Work around pandas.to_timedelta issue with dtypes smaller than int64 and
+    # NumPy 2.0 by casting all int and uint data to int64 and uint64,
+    # respectively. See https://github.com/pandas-dev/pandas/issues/56996 for
+    # more details.
+    if flat_num_dates.dtype.kind == "i":
+        flat_num_dates = flat_num_dates.astype(np.int64)
+    elif flat_num_dates.dtype.kind == "u":
+        flat_num_dates = flat_num_dates.astype(np.uint64)
+
+    time_units, ref_date_str = _unpack_netcdf_time_units(units)
     time_units = _netcdf_to_numpy_timeunit(time_units)
     try:
         # TODO: the strict enforcement of nanosecond precision Timestamps can be
         # relaxed when addressing GitHub issue #7493.
-        ref_date = nanosecond_precision_timestamp(ref_date)
-    except ValueError:
+        ref_date = nanosecond_precision_timestamp(ref_date_str)
+    except ValueError as err:
         # ValueError is raised by pd.Timestamp for non-ISO timestamp
         # strings, in which case we fall back to using cftime
-        raise OutOfBoundsDatetime
+        raise OutOfBoundsDatetime from err
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", "invalid value encountered", RuntimeWarning)
@@ -275,6 +291,8 @@ def _decode_datetime_with_pandas(
     # timedelta64 value, and therefore would raise an error in the lines above.
     if flat_num_dates.dtype.kind in "iu":
         flat_num_dates = flat_num_dates.astype(np.int64)
+    elif flat_num_dates.dtype.kind in "f":
+        flat_num_dates = flat_num_dates.astype(np.float64)
 
     # Cast input ordinals to integers of nanoseconds because pd.to_timedelta
     # works much faster when dealing with integers (GH 1399).
@@ -310,7 +328,7 @@ def decode_cf_datetime(
     cftime.num2date
     """
     num_dates = np.asarray(num_dates)
-    flat_num_dates = num_dates.ravel()
+    flat_num_dates = ravel(num_dates)
     if calendar is None:
         calendar = "standard"
 
@@ -343,7 +361,7 @@ def decode_cf_datetime(
     else:
         dates = _decode_datetime_with_pandas(flat_num_dates, units, calendar)
 
-    return dates.reshape(num_dates.shape)
+    return reshape(dates, num_dates.shape)
 
 
 def to_timedelta_unboxed(value, **kwargs):
@@ -364,8 +382,8 @@ def decode_cf_timedelta(num_timedeltas, units: str) -> np.ndarray:
     """
     num_timedeltas = np.asarray(num_timedeltas)
     units = _netcdf_to_numpy_timeunit(units)
-    result = to_timedelta_unboxed(num_timedeltas.ravel(), unit=units)
-    return result.reshape(num_timedeltas.shape)
+    result = to_timedelta_unboxed(ravel(num_timedeltas), unit=units)
+    return reshape(result, num_timedeltas.shape)
 
 
 def _unit_timedelta_cftime(units: str) -> timedelta:
@@ -423,7 +441,7 @@ def infer_datetime_units(dates) -> str:
     'hours', 'minutes' or 'seconds' (the first one that can evenly divide all
     unique time deltas in `dates`)
     """
-    dates = np.asarray(dates).ravel()
+    dates = ravel(np.asarray(dates))
     if np.asarray(dates).dtype == "datetime64[ns]":
         dates = to_datetime_unboxed(dates)
         dates = dates[pd.notnull(dates)]
@@ -443,15 +461,7 @@ def format_cftime_datetime(date) -> str:
     """Converts a cftime.datetime object to a string with the format:
     YYYY-MM-DD HH:MM:SS.UUUUUU
     """
-    return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}.{:06d}".format(
-        date.year,
-        date.month,
-        date.day,
-        date.hour,
-        date.minute,
-        date.second,
-        date.microsecond,
-    )
+    return f"{date.year:04d}-{date.month:02d}-{date.day:02d} {date.hour:02d}:{date.minute:02d}:{date.second:02d}.{date.microsecond:06d}"
 
 
 def infer_timedelta_units(deltas) -> str:
@@ -459,7 +469,7 @@ def infer_timedelta_units(deltas) -> str:
     {'days', 'hours', 'minutes' 'seconds'} (the first one that can evenly
     divide all unique time deltas in `deltas`)
     """
-    deltas = to_timedelta_unboxed(np.asarray(deltas).ravel())
+    deltas = to_timedelta_unboxed(ravel(np.asarray(deltas)))
     unique_timedeltas = np.unique(deltas[pd.notnull(deltas)])
     return _infer_time_units_from_diff(unique_timedeltas)
 
@@ -474,6 +484,7 @@ def cftime_to_nptime(times, raise_on_invalid: bool = True) -> np.ndarray:
     # TODO: the strict enforcement of nanosecond precision datetime values can
     # be relaxed when addressing GitHub issue #7493.
     new = np.empty(times.shape, dtype="M8[ns]")
+    dt: pd.Timestamp | Literal["NaT"]
     for i, t in np.ndenumerate(times):
         try:
             # Use pandas.Timestamp in place of datetime.datetime, because
@@ -488,7 +499,7 @@ def cftime_to_nptime(times, raise_on_invalid: bool = True) -> np.ndarray:
                 raise ValueError(
                     f"Cannot convert date {t} to a date in the "
                     f"standard calendar.  Reason: {e}."
-                )
+                ) from e
             else:
                 dt = "NaT"
         new[i] = np.datetime64(dt)
@@ -521,7 +532,7 @@ def convert_times(times, date_type, raise_on_invalid: bool = True) -> np.ndarray
                 raise ValueError(
                     f"Cannot convert date {t} to a date in the "
                     f"{date_type(2000, 1, 1).calendar} calendar.  Reason: {e}."
-                )
+                ) from e
             else:
                 dt = np.nan
 
@@ -625,8 +636,10 @@ def _encode_datetime_with_cftime(dates, units: str, calendar: str) -> np.ndarray
     This method is more flexible than xarray's parsing using datetime64[ns]
     arrays but also slower because it loops over each element.
     """
-    if cftime is None:
-        raise ModuleNotFoundError("No module named 'cftime'")
+    if TYPE_CHECKING:
+        import cftime
+    else:
+        cftime = attempt_import("cftime")
 
     if np.issubdtype(dates.dtype, np.datetime64):
         # numpy's broken datetime conversion only works for us precision
@@ -646,7 +659,7 @@ def _encode_datetime_with_cftime(dates, units: str, calendar: str) -> np.ndarray
         except TypeError:
             return np.nan if d is None else cftime.date2num(d, units, calendar)
 
-    return np.array([encode_datetime(d) for d in dates.ravel()]).reshape(dates.shape)
+    return reshape(np.array([encode_datetime(d) for d in ravel(dates)]), dates.shape)
 
 
 def cast_to_int_if_safe(num) -> np.ndarray:
@@ -667,12 +680,48 @@ def _division(deltas, delta, floor):
     return num
 
 
+def _cast_to_dtype_if_safe(num: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="overflow")
+        cast_num = np.asarray(num, dtype=dtype)
+
+    if np.issubdtype(dtype, np.integer):
+        if not (num == cast_num).all():
+            if np.issubdtype(num.dtype, np.floating):
+                raise ValueError(
+                    f"Not possible to cast all encoded times from "
+                    f"{num.dtype!r} to {dtype!r} without losing precision. "
+                    f"Consider modifying the units such that integer values "
+                    f"can be used, or removing the units and dtype encoding, "
+                    f"at which point xarray will make an appropriate choice."
+                )
+            else:
+                raise OverflowError(
+                    f"Not possible to cast encoded times from "
+                    f"{num.dtype!r} to {dtype!r} without overflow. Consider "
+                    f"removing the dtype encoding, at which point xarray will "
+                    f"make an appropriate choice, or explicitly switching to "
+                    "a larger integer dtype."
+                )
+    else:
+        if np.isinf(cast_num).any():
+            raise OverflowError(
+                f"Not possible to cast encoded times from {num.dtype!r} to "
+                f"{dtype!r} without overflow.  Consider removing the dtype "
+                f"encoding, at which point xarray will make an appropriate "
+                f"choice, or explicitly switching to a larger floating point "
+                f"dtype."
+            )
+
+    return cast_num
+
+
 def encode_cf_datetime(
-    dates,
+    dates: T_DuckArray,  # type: ignore[misc]
     units: str | None = None,
     calendar: str | None = None,
     dtype: np.dtype | None = None,
-) -> tuple[np.ndarray, str, str]:
+) -> tuple[T_DuckArray, str, str]:
     """Given an array of datetime objects, returns the tuple `(num, units,
     calendar)` suitable for a CF compliant time variable.
 
@@ -682,7 +731,21 @@ def encode_cf_datetime(
     --------
     cftime.date2num
     """
-    dates = np.asarray(dates)
+    dates = asarray(dates)
+    if is_chunked_array(dates):
+        return _lazily_encode_cf_datetime(dates, units, calendar, dtype)
+    else:
+        return _eagerly_encode_cf_datetime(dates, units, calendar, dtype)
+
+
+def _eagerly_encode_cf_datetime(
+    dates: T_DuckArray,  # type: ignore[misc]
+    units: str | None = None,
+    calendar: str | None = None,
+    dtype: np.dtype | None = None,
+    allow_units_modification: bool = True,
+) -> tuple[T_DuckArray, str, str]:
+    dates = asarray(dates)
 
     data_units = infer_datetime_units(dates)
 
@@ -706,7 +769,7 @@ def encode_cf_datetime(
         # Wrap the dates in a DatetimeIndex to do the subtraction to ensure
         # an OverflowError is raised if the ref_date is too far away from
         # dates to be encoded (GH 2272).
-        dates_as_index = pd.DatetimeIndex(dates.ravel())
+        dates_as_index = pd.DatetimeIndex(ravel(dates))
         time_deltas = dates_as_index - ref_date
 
         # retrieve needed units to faithfully encode to int64
@@ -721,7 +784,7 @@ def encode_cf_datetime(
         # needed time delta to encode faithfully to int64
         needed_time_delta = _time_units_to_timedelta64(needed_units)
 
-        floor_division = True
+        floor_division = np.issubdtype(dtype, np.integer) or dtype is None
         if time_delta > needed_time_delta:
             floor_division = False
             if dtype is None:
@@ -731,7 +794,7 @@ def encode_cf_datetime(
                     f"Set encoding['dtype'] to integer dtype to serialize to int64. "
                     f"Set encoding['dtype'] to floating point dtype to silence this warning."
                 )
-            elif np.issubdtype(dtype, np.integer):
+            elif np.issubdtype(dtype, np.integer) and allow_units_modification:
                 new_units = f"{needed_units} since {format_timestamp(ref_date)}"
                 emit_user_level_warning(
                     f"Times can't be serialized faithfully to int64 with requested units {units!r}. "
@@ -744,7 +807,7 @@ def encode_cf_datetime(
                 floor_division = True
 
         num = _division(time_deltas, time_delta, floor_division)
-        num = num.values.reshape(dates.shape)
+        num = reshape(num.values, dates.shape)
 
     except (OutOfBoundsDatetime, OverflowError, ValueError):
         num = _encode_datetime_with_cftime(dates, units, calendar)
@@ -752,19 +815,87 @@ def encode_cf_datetime(
         # we already covered for this in pandas-based flow
         num = cast_to_int_if_safe(num)
 
-    return (num, units, calendar)
+    if dtype is not None:
+        num = _cast_to_dtype_if_safe(num, dtype)
+
+    return num, units, calendar
+
+
+def _encode_cf_datetime_within_map_blocks(
+    dates: T_DuckArray,  # type: ignore[misc]
+    units: str,
+    calendar: str,
+    dtype: np.dtype,
+) -> T_DuckArray:
+    num, *_ = _eagerly_encode_cf_datetime(
+        dates, units, calendar, dtype, allow_units_modification=False
+    )
+    return num
+
+
+def _lazily_encode_cf_datetime(
+    dates: T_ChunkedArray,
+    units: str | None = None,
+    calendar: str | None = None,
+    dtype: np.dtype | None = None,
+) -> tuple[T_ChunkedArray, str, str]:
+    if calendar is None:
+        # This will only trigger minor compute if dates is an object dtype array.
+        calendar = infer_calendar_name(dates)
+
+    if units is None and dtype is None:
+        if dates.dtype == "O":
+            units = "microseconds since 1970-01-01"
+            dtype = np.dtype("int64")
+        else:
+            units = "nanoseconds since 1970-01-01"
+            dtype = np.dtype("int64")
+
+    if units is None or dtype is None:
+        raise ValueError(
+            f"When encoding chunked arrays of datetime values, both the units "
+            f"and dtype must be prescribed or both must be unprescribed. "
+            f"Prescribing only one or the other is not currently supported. "
+            f"Got a units encoding of {units} and a dtype encoding of {dtype}."
+        )
+
+    chunkmanager = get_chunked_array_type(dates)
+    num = chunkmanager.map_blocks(
+        _encode_cf_datetime_within_map_blocks,
+        dates,
+        units,
+        calendar,
+        dtype,
+        dtype=dtype,
+    )
+    return num, units, calendar
 
 
 def encode_cf_timedelta(
-    timedeltas, units: str | None = None, dtype: np.dtype | None = None
-) -> tuple[np.ndarray, str]:
+    timedeltas: T_DuckArray,  # type: ignore[misc]
+    units: str | None = None,
+    dtype: np.dtype | None = None,
+) -> tuple[T_DuckArray, str]:
+    timedeltas = asarray(timedeltas)
+    if is_chunked_array(timedeltas):
+        return _lazily_encode_cf_timedelta(timedeltas, units, dtype)
+    else:
+        return _eagerly_encode_cf_timedelta(timedeltas, units, dtype)
+
+
+def _eagerly_encode_cf_timedelta(
+    timedeltas: T_DuckArray,  # type: ignore[misc]
+    units: str | None = None,
+    dtype: np.dtype | None = None,
+    allow_units_modification: bool = True,
+) -> tuple[T_DuckArray, str]:
     data_units = infer_timedelta_units(timedeltas)
 
     if units is None:
         units = data_units
 
     time_delta = _time_units_to_timedelta64(units)
-    time_deltas = pd.TimedeltaIndex(timedeltas.ravel())
+    time_deltas = pd.TimedeltaIndex(ravel(timedeltas))
 
     # retrieve needed units to faithfully encode to int64
     needed_units = data_units
@@ -774,7 +905,7 @@ def encode_cf_timedelta(
     # needed time delta to encode faithfully to int64
     needed_time_delta = _time_units_to_timedelta64(needed_units)
 
-    floor_division = True
+    floor_division = np.issubdtype(dtype, np.integer) or dtype is None
     if time_delta > needed_time_delta:
         floor_division = False
         if dtype is None:
@@ -784,7 +915,7 @@ def encode_cf_timedelta(
                 f"Set encoding['dtype'] to integer dtype to serialize to int64. "
                 f"Set encoding['dtype'] to floating point dtype to silence this warning."
             )
-        elif np.issubdtype(dtype, np.integer):
+        elif np.issubdtype(dtype, np.integer) and allow_units_modification:
             emit_user_level_warning(
                 f"Timedeltas can't be serialized faithfully with requested units {units!r}. "
                 f"Serializing with units {needed_units!r} instead. "
@@ -796,8 +927,50 @@ def encode_cf_timedelta(
             floor_division = True
 
     num = _division(time_deltas, time_delta, floor_division)
-    num = num.values.reshape(timedeltas.shape)
-    return (num, units)
+    num = reshape(num.values, timedeltas.shape)
+
+    if dtype is not None:
+        num = _cast_to_dtype_if_safe(num, dtype)
+
+    return num, units
+
+
+def _encode_cf_timedelta_within_map_blocks(
+    timedeltas: T_DuckArray,  # type: ignore[misc]
+    units: str,
+    dtype: np.dtype,
+) -> T_DuckArray:
+    num, _ = _eagerly_encode_cf_timedelta(
+        timedeltas, units, dtype, allow_units_modification=False
+    )
+    return num
+
+
+def _lazily_encode_cf_timedelta(
+    timedeltas: T_ChunkedArray, units: str | None = None, dtype: np.dtype | None = None
+) -> tuple[T_ChunkedArray, str]:
+    if units is None and dtype is None:
+        units = "nanoseconds"
+        dtype = np.dtype("int64")
+
+    if units is None or dtype is None:
+        raise ValueError(
+            f"When encoding chunked arrays of timedelta values, both the "
+            f"units and dtype must be prescribed or both must be "
+            f"unprescribed. Prescribing only one or the other is not "
+            f"currently supported. Got a units encoding of {units} and a "
+            f"dtype encoding of {dtype}."
+        )
+
+    chunkmanager = get_chunked_array_type(timedeltas)
+    num = chunkmanager.map_blocks(
+        _encode_cf_timedelta_within_map_blocks,
+        timedeltas,
+        units,
+        dtype,
+        dtype=dtype,
+    )
+    return num, units
 
 
 class CFDatetimeCoder(VariableCoder):

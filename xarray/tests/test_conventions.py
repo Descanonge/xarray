@@ -52,10 +52,9 @@ def test_decode_cf_with_conflicting_fill_missing_value() -> None:
     var = Variable(
         ["t"], np.arange(3), {"units": "foobar", "missing_value": 0, "_FillValue": 1}
     )
-    with warnings.catch_warnings(record=True) as w:
+    with pytest.warns(SerializationWarning, match="has multiple fill"):
         actual = conventions.decode_cf_variable("t", var)
         assert_identical(actual, expected)
-        assert "has multiple fill" in str(w[0].message)
 
     expected = Variable(["t"], np.arange(10), {"units": "foobar"})
 
@@ -64,7 +63,13 @@ def test_decode_cf_with_conflicting_fill_missing_value() -> None:
         np.arange(10),
         {"units": "foobar", "missing_value": np.nan, "_FillValue": np.nan},
     )
-    actual = conventions.decode_cf_variable("t", var)
+
+    # the following code issues two warnings, so we need to check for both
+    with pytest.warns(SerializationWarning) as winfo:
+        actual = conventions.decode_cf_variable("t", var)
+    for aw in winfo:
+        assert "non-conforming" in str(aw.message)
+
     assert_identical(actual, expected)
 
     var = Variable(
@@ -76,7 +81,12 @@ def test_decode_cf_with_conflicting_fill_missing_value() -> None:
             "_FillValue": np.float32(np.nan),
         },
     )
-    actual = conventions.decode_cf_variable("t", var)
+
+    # the following code issues two warnings, so we need to check for both
+    with pytest.warns(SerializationWarning) as winfo:
+        actual = conventions.decode_cf_variable("t", var)
+    for aw in winfo:
+        assert "non-conforming" in str(aw.message)
     assert_identical(actual, expected)
 
 
@@ -109,7 +119,7 @@ class TestEncodeCFVariable:
             Variable(
                 ["t"], pd.date_range("2000-01-01", periods=3), {"units": "foobar"}
             ),
-            Variable(["t"], pd.to_timedelta(["1 day"]), {"units": "foobar"}),
+            Variable(["t"], pd.to_timedelta(["1 day"]), {"units": "foobar"}),  # type: ignore[arg-type, unused-ignore]
             Variable(["t"], [0, 1, 2], {"add_offset": 0}, {"add_offset": 2}),
             Variable(["t"], [0, 1, 2], {"_FillValue": 0}, {"_FillValue": 2}),
         ]
@@ -284,6 +294,96 @@ class TestDecodeCF:
         actual = conventions.decode_cf(original)
         assert actual.foo.encoding["coordinates"] == "x"
 
+    def test_decode_coordinates_with_key_values(self) -> None:
+        # regression test for GH9761
+        original = Dataset(
+            {
+                "temp": (
+                    ("y", "x"),
+                    np.random.rand(2, 2),
+                    {
+                        "long_name": "temperature",
+                        "units": "K",
+                        "coordinates": "lat lon",
+                        "grid_mapping": "crs",
+                    },
+                ),
+                "x": (
+                    ("x"),
+                    np.arange(2),
+                    {"standard_name": "projection_x_coordinate", "units": "m"},
+                ),
+                "y": (
+                    ("y"),
+                    np.arange(2),
+                    {"standard_name": "projection_y_coordinate", "units": "m"},
+                ),
+                "lat": (
+                    ("y", "x"),
+                    np.random.rand(2, 2),
+                    {"standard_name": "latitude", "units": "degrees_north"},
+                ),
+                "lon": (
+                    ("y", "x"),
+                    np.random.rand(2, 2),
+                    {"standard_name": "longitude", "units": "degrees_east"},
+                ),
+                "crs": (
+                    (),
+                    None,
+                    {
+                        "grid_mapping_name": "transverse_mercator",
+                        "longitude_of_central_meridian": -2.0,
+                    },
+                ),
+                "crs2": (
+                    (),
+                    None,
+                    {
+                        "grid_mapping_name": "longitude_latitude",
+                        "longitude_of_central_meridian": -2.0,
+                    },
+                ),
+            },
+        )
+
+        original.temp.attrs["grid_mapping"] = "crs: x y"
+        vars, attrs, coords = conventions.decode_cf_variables(
+            original.variables, {}, decode_coords="all"
+        )
+        assert coords == {"lat", "lon", "crs"}
+
+        original.temp.attrs["grid_mapping"] = "crs: x y crs2: lat lon"
+        vars, attrs, coords = conventions.decode_cf_variables(
+            original.variables, {}, decode_coords="all"
+        )
+        assert coords == {"lat", "lon", "crs", "crs2"}
+
+        # stray colon
+        original.temp.attrs["grid_mapping"] = "crs: x y crs2 : lat lon"
+        vars, attrs, coords = conventions.decode_cf_variables(
+            original.variables, {}, decode_coords="all"
+        )
+        assert coords == {"lat", "lon", "crs", "crs2"}
+
+        original.temp.attrs["grid_mapping"] = "crs x y crs2: lat lon"
+        with pytest.raises(ValueError, match="misses ':'"):
+            conventions.decode_cf_variables(original.variables, {}, decode_coords="all")
+
+        del original.temp.attrs["grid_mapping"]
+        original.temp.attrs["formula_terms"] = "A: lat D: lon E: crs2"
+        vars, attrs, coords = conventions.decode_cf_variables(
+            original.variables, {}, decode_coords="all"
+        )
+        assert coords == {"lat", "lon", "crs2"}
+
+        original.temp.attrs["formula_terms"] = "A: lat lon D: crs E: crs2"
+        with pytest.warns(UserWarning, match="has malformed content"):
+            vars, attrs, coords = conventions.decode_cf_variables(
+                original.variables, {}, decode_coords="all"
+            )
+            assert coords == {"lat", "lon", "crs", "crs2"}
+
     def test_0d_int32_encoding(self) -> None:
         original = Variable((), np.int32(0), encoding={"dtype": "int64"})
         expected = Variable((), np.int64(0))
@@ -293,10 +393,9 @@ class TestDecodeCF:
     def test_decode_cf_with_multiple_missing_values(self) -> None:
         original = Variable(["t"], [0, 1, 2], {"missing_value": np.array([0, 1])})
         expected = Variable(["t"], [np.nan, np.nan, 2], {})
-        with warnings.catch_warnings(record=True) as w:
+        with pytest.warns(SerializationWarning, match="has multiple fill"):
             actual = conventions.decode_cf_variable("t", original)
             assert_identical(expected, actual)
-            assert "has multiple fill" in str(w[0].message)
 
     def test_decode_cf_with_drop_variables(self) -> None:
         original = Dataset(
@@ -387,7 +486,6 @@ class TestDecodeCF:
             }
         ).chunk()
         decoded = conventions.decode_cf(original)
-        print(decoded)
         assert all(
             isinstance(var.data, da.Array)
             for name, var in decoded.variables.items()
@@ -495,6 +593,18 @@ class TestCFEncodedDataStore(CFEncodedBase):
         pass
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        np.array([["ab", "cdef", b"X"], [1, 2, "c"]], dtype=object),
+        np.array([["x", 1], ["y", 2]], dtype="object"),
+    ],
+)
+def test_infer_dtype_error_on_mixed_types(data):
+    with pytest.raises(ValueError, match="unable to infer dtype on variable"):
+        conventions._infer_dtype(data, "test")
+
+
 class TestDecodeCFVariableWithArrayUnits:
     def test_decode_cf_variable_with_array_units(self) -> None:
         v = Variable(["t"], [1, 2, 3], {"units": np.array(["foobar"], dtype=object)})
@@ -544,10 +654,10 @@ def test_encode_cf_variable_with_vlen_dtype() -> None:
     )
     encoded_v = conventions.encode_cf_variable(v)
     assert encoded_v.data.dtype.kind == "O"
-    assert coding.strings.check_vlen_dtype(encoded_v.data.dtype) == str
+    assert coding.strings.check_vlen_dtype(encoded_v.data.dtype) is str
 
     # empty array
     v = Variable(["x"], np.array([], dtype=coding.strings.create_vlen_dtype(str)))
     encoded_v = conventions.encode_cf_variable(v)
     assert encoded_v.data.dtype.kind == "O"
-    assert coding.strings.check_vlen_dtype(encoded_v.data.dtype) == str
+    assert coding.strings.check_vlen_dtype(encoded_v.data.dtype) is str

@@ -25,4 +25,6 @@ examples that describe many common tasks that you can accomplish with xarray.
    dask
    plotting
    options
+   testing
    duckarrays
+   hierarchical-data

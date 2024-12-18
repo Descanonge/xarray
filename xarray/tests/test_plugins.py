@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 import sys
-from importlib.metadata import EntryPoint
-
-if sys.version_info >= (3, 10):
-    from importlib.metadata import EntryPoints
-else:
-    EntryPoints = list[EntryPoint]
+from importlib.metadata import EntryPoint, EntryPoints
 from unittest import mock
 
 import pytest
@@ -16,7 +11,6 @@ from xarray.tests import (
     has_h5netcdf,
     has_netCDF4,
     has_pydap,
-    has_pynio,
     has_scipy,
     has_zarr,
 )
@@ -27,22 +21,22 @@ importlib_metadata_mock = "importlib.metadata"
 
 
 class DummyBackendEntrypointArgs(common.BackendEntrypoint):
-    def open_dataset(filename_or_obj, *args):
+    def open_dataset(filename_or_obj, *args):  # type: ignore[override]
         pass
 
 
 class DummyBackendEntrypointKwargs(common.BackendEntrypoint):
-    def open_dataset(filename_or_obj, **kwargs):
+    def open_dataset(filename_or_obj, **kwargs):  # type: ignore[override]
         pass
 
 
 class DummyBackendEntrypoint1(common.BackendEntrypoint):
-    def open_dataset(self, filename_or_obj, *, decoder):
+    def open_dataset(self, filename_or_obj, *, decoder):  # type: ignore[override]
         pass
 
 
 class DummyBackendEntrypoint2(common.BackendEntrypoint):
-    def open_dataset(self, filename_or_obj, *, decoder):
+    def open_dataset(self, filename_or_obj, *, decoder):  # type: ignore[override]
         pass
 
 
@@ -218,28 +212,28 @@ def test_lazy_import() -> None:
     When importing xarray these should not be imported as well.
     Only when running code for the first time that requires them.
     """
-    blacklisted = [
-        "h5netcdf",
-        "netCDF4",
-        "pydap",
-        "Nio",
-        "scipy",
-        "zarr",
-        "matplotlib",
-        "nc_time_axis",
-        "flox",
+    deny_list = [
+        "cubed",
+        "cupy",
         # "dask",  # TODO: backends.locks is not lazy yet :(
         "dask.array",
         "dask.distributed",
-        "sparse",
-        "cupy",
+        "flox",
+        "h5netcdf",
+        "matplotlib",
+        "nc_time_axis",
+        "netCDF4",
+        "numbagg",
         "pint",
-        "cubed",
+        "pydap",
+        "scipy",
+        "sparse",
+        "zarr",
     ]
     # ensure that none of the above modules has been imported before
     modules_backup = {}
     for pkg in list(sys.modules.keys()):
-        for mod in blacklisted + ["xarray"]:
+        for mod in deny_list + ["xarray"]:
             if pkg.startswith(mod):
                 modules_backup[pkg] = sys.modules[pkg]
                 del sys.modules[pkg]
@@ -255,7 +249,7 @@ def test_lazy_import() -> None:
         # lazy loaded are loaded when importing xarray
         is_imported = set()
         for pkg in sys.modules:
-            for mod in blacklisted:
+            for mod in deny_list:
                 if pkg.startswith(mod):
                     is_imported.add(mod)
                     break
@@ -279,7 +273,6 @@ def test_list_engines() -> None:
     assert ("netcdf4" in engines) == has_netCDF4
     assert ("pydap" in engines) == has_pydap
     assert ("zarr" in engines) == has_zarr
-    assert ("pynio" in engines) == has_pynio
     assert "store" in engines
 
 
@@ -290,10 +283,7 @@ def test_refresh_engines() -> None:
     EntryPointMock1.name = "test1"
     EntryPointMock1.load.return_value = DummyBackendEntrypoint1
 
-    if sys.version_info >= (3, 10):
-        return_value = EntryPoints([EntryPointMock1])
-    else:
-        return_value = {"xarray.backends": [EntryPointMock1]}
+    return_value = EntryPoints([EntryPointMock1])
 
     with mock.patch("xarray.backends.plugins.entry_points", return_value=return_value):
         list_engines.cache_clear()
@@ -305,10 +295,7 @@ def test_refresh_engines() -> None:
     EntryPointMock2.name = "test2"
     EntryPointMock2.load.return_value = DummyBackendEntrypoint2
 
-    if sys.version_info >= (3, 10):
-        return_value2 = EntryPoints([EntryPointMock2])
-    else:
-        return_value2 = {"xarray.backends": [EntryPointMock2]}
+    return_value2 = EntryPoints([EntryPointMock2])
 
     with mock.patch("xarray.backends.plugins.entry_points", return_value=return_value2):
         refresh_engines()

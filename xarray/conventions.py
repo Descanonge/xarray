@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import itertools
 from collections import defaultdict
 from collections.abc import Hashable, Iterable, Mapping, MutableMapping
-from typing import TYPE_CHECKING, Any, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union
 
 import numpy as np
 import pandas as pd
@@ -14,9 +15,9 @@ from xarray.core.common import (
     _contains_datetime_like_objects,
     contains_cftime_datetimes,
 )
-from xarray.core.pycompat import is_duck_dask_array
 from xarray.core.utils import emit_user_level_warning
 from xarray.core.variable import IndexVariable, Variable
+from xarray.namedarray.utils import is_duck_dask_array
 
 CF_RELATED_DATA = (
     "bounds",
@@ -31,6 +32,7 @@ CF_RELATED_DATA = (
     "formula_terms",
 )
 CF_RELATED_DATA_NEEDS_PARSING = (
+    "grid_mapping",
     "cell_measures",
     "formula_terms",
 )
@@ -48,19 +50,22 @@ if TYPE_CHECKING:
     T_DatasetOrAbstractstore = Union[Dataset, AbstractDataStore]
 
 
-def _var_as_tuple(var: Variable) -> T_VarTuple:
-    return var.dims, var.data, var.attrs.copy(), var.encoding.copy()
-
-
-def _infer_dtype(array, name: T_Name = None) -> np.dtype:
-    """Given an object array with no missing values, infer its dtype from its
-    first element
-    """
+def _infer_dtype(array, name=None):
+    """Given an object array with no missing values, infer its dtype from all elements."""
     if array.dtype.kind != "O":
         raise TypeError("infer_type must be called on a dtype=object array")
 
     if array.size == 0:
         return np.dtype(float)
+
+    native_dtypes = set(np.vectorize(type, otypes=[object])(array.ravel()))
+    if len(native_dtypes) > 1 and native_dtypes != {bytes, str}:
+        raise ValueError(
+            "unable to infer dtype on variable {!r}; object array "
+            "contains mixed native types: {}".format(
+                name, ", ".join(x.__name__ for x in native_dtypes)
+            )
+        )
 
     element = array[(0,) * array.ndim]
     # We use the base types to avoid subclasses of bytes and str (which might
@@ -81,13 +86,17 @@ def _infer_dtype(array, name: T_Name = None) -> np.dtype:
 
 
 def ensure_not_multiindex(var: Variable, name: T_Name = None) -> None:
-    if isinstance(var, IndexVariable) and isinstance(var.to_index(), pd.MultiIndex):
-        raise NotImplementedError(
-            f"variable {name!r} is a MultiIndex, which cannot yet be "
-            "serialized to netCDF files. Instead, either use reset_index() "
-            "to convert MultiIndex levels into coordinate variables instead "
-            "or use https://cf-xarray.readthedocs.io/en/latest/coding.html."
-        )
+    # only the pandas multi-index dimension coordinate cannot be serialized (tuple values)
+    if isinstance(var._data, indexing.PandasMultiIndexingAdapter):
+        if name is None and isinstance(var, IndexVariable):
+            name = var.name
+        if var.dims == (name,):
+            raise NotImplementedError(
+                f"variable {name!r} is a MultiIndex, which cannot yet be "
+                "serialized. Instead, either use reset_index() "
+                "to convert MultiIndex levels into coordinate variables instead "
+                "or use https://cf-xarray.readthedocs.io/en/latest/coding.html."
+            )
 
 
 def _copy_with_dtype(data, dtype: np.typing.DTypeLike):
@@ -104,7 +113,7 @@ def _copy_with_dtype(data, dtype: np.typing.DTypeLike):
 def ensure_dtype_not_object(var: Variable, name: T_Name = None) -> Variable:
     # TODO: move this from conventions to backends? (it's not CF related)
     if var.dtype.kind == "O":
-        dims, data, attrs, encoding = _var_as_tuple(var)
+        dims, data, attrs, encoding = variables.unpack_for_encoding(var)
 
         # leave vlen dtypes unchanged
         if strings.check_vlen_dtype(data.dtype) is not None:
@@ -155,7 +164,7 @@ def encode_cf_variable(
     var: Variable, needs_copy: bool = True, name: T_Name = None
 ) -> Variable:
     """
-    Converts an Variable into an Variable which follows some
+    Converts a Variable into a Variable which follows some
     of the CF conventions:
 
         - Nans are masked using _FillValue (or the deprecated missing_value)
@@ -180,7 +189,7 @@ def encode_cf_variable(
         times.CFTimedeltaCoder(),
         variables.CFScaleOffsetCoder(),
         variables.CFMaskCoder(),
-        variables.UnsignedIntegerCoder(),
+        variables.NativeEnumCoder(),
         variables.NonStringCoder(),
         variables.DefaultFillvalueCoder(),
         variables.BooleanCoder(),
@@ -265,13 +274,15 @@ def decode_cf_variable(
             var = strings.CharacterArrayCoder().decode(var, name=name)
         var = strings.EncodedStringCoder().decode(var)
 
-    if original_dtype == object:
+    if original_dtype.kind == "O":
         var = variables.ObjectVLenStringCoder().decode(var)
         original_dtype = var.dtype
 
+    if original_dtype.kind == "T":
+        var = variables.Numpy2StringDTypeCoder().decode(var)
+
     if mask_and_scale:
         for coder in [
-            variables.UnsignedIntegerCoder(),
             variables.CFMaskCoder(),
             variables.CFScaleOffsetCoder(),
         ]:
@@ -359,13 +370,13 @@ def _update_bounds_encoding(variables: T_Variables) -> None:
             and attrs["bounds"] in variables
         ):
             emit_user_level_warning(
-                f"Variable {name:s} has datetime type and a "
-                f"bounds variable but {name:s}.encoding does not have "
-                f"units specified. The units encodings for {name:s} "
+                f"Variable {name} has datetime type and a "
+                f"bounds variable but {name}.encoding does not have "
+                f"units specified. The units encodings for {name} "
                 f"and {attrs['bounds']} will be determined independently "
                 "and may not be equal, counter to CF-conventions. "
                 "If this is a concern, specify a units encoding for "
-                f"{name:s} before writing to a file.",
+                f"{name} before writing to a file.",
             )
 
         if has_date_units and "bounds" in attrs:
@@ -376,16 +387,26 @@ def _update_bounds_encoding(variables: T_Variables) -> None:
                     bounds_encoding.setdefault("calendar", encoding["calendar"])
 
 
+T = TypeVar("T")
+
+
+def _item_or_default(obj: Mapping[Any, T] | T, key: Hashable, default: T) -> T:
+    """
+    Return item by key if obj is mapping and key is present, else return default value.
+    """
+    return obj.get(key, default) if isinstance(obj, Mapping) else obj
+
+
 def decode_cf_variables(
     variables: T_Variables,
     attributes: T_Attrs,
-    concat_characters: bool = True,
-    mask_and_scale: bool = True,
-    decode_times: bool = True,
+    concat_characters: bool | Mapping[str, bool] = True,
+    mask_and_scale: bool | Mapping[str, bool] = True,
+    decode_times: bool | Mapping[str, bool] = True,
     decode_coords: bool | Literal["coordinates", "all"] = True,
     drop_variables: T_DropVariables = None,
-    use_cftime: bool | None = None,
-    decode_timedelta: bool | None = None,
+    use_cftime: bool | Mapping[str, bool] | None = None,
+    decode_timedelta: bool | Mapping[str, bool] | None = None,
 ) -> tuple[T_Variables, T_Attrs, set[Hashable]]:
     """
     Decode several CF encoded variables.
@@ -423,7 +444,7 @@ def decode_cf_variables(
         if k in drop_variables:
             continue
         stack_char_dim = (
-            concat_characters
+            _item_or_default(concat_characters, k, True)
             and v.dtype == "S1"
             and v.ndim > 0
             and stackable(v.dims[-1])
@@ -432,15 +453,15 @@ def decode_cf_variables(
             new_vars[k] = decode_cf_variable(
                 k,
                 v,
-                concat_characters=concat_characters,
-                mask_and_scale=mask_and_scale,
-                decode_times=decode_times,
+                concat_characters=_item_or_default(concat_characters, k, True),
+                mask_and_scale=_item_or_default(mask_and_scale, k, True),
+                decode_times=_item_or_default(decode_times, k, True),
                 stack_char_dim=stack_char_dim,
-                use_cftime=use_cftime,
-                decode_timedelta=decode_timedelta,
+                use_cftime=_item_or_default(use_cftime, k, None),
+                decode_timedelta=_item_or_default(decode_timedelta, k, None),
             )
         except Exception as e:
-            raise type(e)(f"Failed to decode variable {k!r}: {e}")
+            raise type(e)(f"Failed to decode variable {k!r}: {e}") from e
         if decode_coords in [True, "coordinates", "all"]:
             var_attrs = new_vars[k].attrs
             if "coordinates" in var_attrs:
@@ -457,20 +478,41 @@ def decode_cf_variables(
         if decode_coords == "all":
             for attr_name in CF_RELATED_DATA:
                 if attr_name in var_attrs:
-                    attr_val = var_attrs[attr_name]
-                    if attr_name not in CF_RELATED_DATA_NEEDS_PARSING:
-                        var_names = attr_val.split()
-                    else:
-                        roles_and_names = [
-                            role_or_name
-                            for part in attr_val.split(":")
-                            for role_or_name in part.split()
-                        ]
-                        if len(roles_and_names) % 2 == 1:
-                            emit_user_level_warning(
-                                f"Attribute {attr_name:s} malformed"
-                            )
-                        var_names = roles_and_names[1::2]
+                    # fixes stray colon
+                    attr_val = var_attrs[attr_name].replace(" :", ":")
+                    var_names = attr_val.split()
+                    # if grid_mapping is a single string, do not enter here
+                    if (
+                        attr_name in CF_RELATED_DATA_NEEDS_PARSING
+                        and len(var_names) > 1
+                    ):
+                        # map the keys to list of strings
+                        # "A: b c d E: f g" returns
+                        # {"A": ["b", "c", "d"], "E": ["f", "g"]}
+                        roles_and_names = defaultdict(list)
+                        key = None
+                        for vname in var_names:
+                            if ":" in vname:
+                                key = vname.strip(":")
+                            else:
+                                if key is None:
+                                    raise ValueError(
+                                        f"First element {vname!r} of [{attr_val!r}] misses ':', "
+                                        f"cannot decode {attr_name!r}."
+                                    )
+                                roles_and_names[key].append(vname)
+                        # for grid_mapping keys are var_names
+                        if attr_name == "grid_mapping":
+                            var_names = list(roles_and_names.keys())
+                        else:
+                            # for cell_measures and formula_terms values are var names
+                            var_names = list(itertools.chain(*roles_and_names.values()))
+                            # consistency check (one element per key)
+                            if len(var_names) != len(roles_and_names.keys()):
+                                emit_user_level_warning(
+                                    f"Attribute {attr_name!r} has malformed content [{attr_val!r}], "
+                                    f"decoding {var_names!r} to coordinates."
+                                )
                     if all(var_name in variables for var_name in var_names):
                         new_vars[k].encoding[attr_name] = attr_val
                         coord_names.update(var_names)
@@ -481,7 +523,7 @@ def decode_cf_variables(
                             if proj_name not in variables
                         ]
                         emit_user_level_warning(
-                            f"Variable(s) referenced in {attr_name:s} not in variables: {referenced_vars_not_in_variables!s}",
+                            f"Variable(s) referenced in {attr_name} not in variables: {referenced_vars_not_in_variables}",
                         )
                     del var_attrs[attr_name]
 
@@ -626,12 +668,18 @@ def cf_decoder(
     decode_cf_variable
     """
     variables, attributes, _ = decode_cf_variables(
-        variables, attributes, concat_characters, mask_and_scale, decode_times
+        variables,
+        attributes,
+        concat_characters,
+        mask_and_scale,
+        decode_times,
     )
     return variables, attributes
 
 
-def _encode_coordinates(variables, attributes, non_dim_coord_names):
+def _encode_coordinates(
+    variables: T_Variables, attributes: T_Attrs, non_dim_coord_names
+):
     # calculate global and variable specific coordinates
     non_dim_coord_names = set(non_dim_coord_names)
 
@@ -659,7 +707,7 @@ def _encode_coordinates(variables, attributes, non_dim_coord_names):
                 variable_coordinates[k].add(coord_name)
 
             if any(
-                attr_name in v.encoding and coord_name in v.encoding.get(attr_name)
+                coord_name in v.encoding.get(attr_name, tuple())
                 for attr_name in CF_RELATED_DATA
             ):
                 not_technically_coordinates.add(coord_name)
@@ -709,7 +757,7 @@ def _encode_coordinates(variables, attributes, non_dim_coord_names):
     # the dataset faithfully. Because this serialization goes beyond CF
     # conventions, only do it if necessary.
     # Reference discussion:
-    # http://mailman.cgd.ucar.edu/pipermail/cf-metadata/2014/007571.html
+    # https://cfconventions.org/mailing-list-archive/Data/7400.html
     global_coordinates.difference_update(written_coords)
     if global_coordinates:
         attributes = dict(attributes)
@@ -726,7 +774,7 @@ def _encode_coordinates(variables, attributes, non_dim_coord_names):
     return variables, attributes
 
 
-def encode_dataset_coordinates(dataset):
+def encode_dataset_coordinates(dataset: Dataset):
     """Encode coordinates on the given dataset object into variable specific
     and global attributes.
 
@@ -748,7 +796,7 @@ def encode_dataset_coordinates(dataset):
     )
 
 
-def cf_encoder(variables, attributes):
+def cf_encoder(variables: T_Variables, attributes: T_Attrs):
     """
     Encode a set of CF encoded variables and attributes.
     Takes a dicts of variables and attributes and encodes them
@@ -782,7 +830,7 @@ def cf_encoder(variables, attributes):
 
     # Remove attrs from bounds variables (issue #2921)
     for var in new_vars.values():
-        bounds = var.attrs["bounds"] if "bounds" in var.attrs else None
+        bounds = var.attrs.get("bounds")
         if bounds and bounds in new_vars:
             # see http://cfconventions.org/cf-conventions/cf-conventions.html#cell-boundaries
             for attr in [
