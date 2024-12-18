@@ -12,6 +12,12 @@ div.bd-header-announcement {
   color: #000;
 }
 
+.bd-article {
+   a.headerlink {
+    display: none !important;
+   }
+}
+
 /* Reduce left and right margins */
 
 .container, .container-lg, .container-md, .container-sm, .container-xl {
